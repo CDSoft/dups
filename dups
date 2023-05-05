@@ -1,0 +1,120 @@
+#!/usr/bin/env python
+
+""" dups [options] directory1 [directory2 ...]
+
+Find duplicate files. All directories must be on the same device.
+
+Options:
+-h|--help       display this help
+--hardlink      hard link duplicate files
+--hidehardlinks do not list file starting at the same inode
+"""
+
+import os
+import hashlib
+import sys
+
+def usage():
+    print(__doc__.strip())
+    sys.exit(-1)
+
+def error(msg):
+    print(msg)
+    sys.exit(-1)
+
+def get_files(directories):
+    for directory in directories:
+        for dirpath, dirnames, filenames in os.walk(directory):
+            for name in filenames:
+                name = os.path.join(dirpath, name)
+                if os.path.isfile(name) and not os.path.islink(name):
+                    if os.stat(name).st_size > 0:
+                        dev = os.stat(name).st_dev
+                        ino = os.stat(name).st_ino
+                        yield (name, dev, ino)
+
+def group_by(files, func):
+    groups = {}
+    for (name, dev, ino) in files:
+        try: key = func(name, dev, ino)
+        except IOError: continue
+        except OSError: continue
+        try: groups[key].append((name, dev, ino))
+        except KeyError: groups[key] = [(name, dev, ino)]
+    return (files for files in groups.values() if len(files) > 1)
+
+def get_size(name, dev=None, ino=None):
+    return os.stat(name).st_size
+
+def get_start(name, dev=None, ino=None):
+    return open(name, 'rb').read(1024)
+
+_hash = {}
+def get_hash(name, dev, ino):
+    if (dev, ino) in _hash: return _hash[(dev, ino)]
+    s = hashlib.sha512()
+    f = open(name, 'rb')
+    while True:
+        data = f.read(16*1024)
+        if not data: break
+        s.update(data)
+    f.close()
+    hash = s.digest()
+    _hash[(dev, ino)] = hash
+    return hash
+
+def same(name1, name2):
+    assert get_size(name1) == get_size(name2)
+    f1 = open(name1, 'rb')
+    f2 = open(name2, 'rb')
+    while True:
+        data1 = f1.read(16*1024)
+        data2 = f2.read(16*1024)
+        if data1 != data2: return False
+        if not data1 or not data2: return True
+
+def fsize(size):
+    for e, u in ((3,'G'),(2,'M'),(1,'K')):
+        if size >= 1024**e: return "%d%s"%(size/1024**e, u)
+    return "%d"%size
+
+if __name__ == '__main__':
+
+    do_hardlinks = False
+    do_hidehardlinks = False
+    directories = []
+    params = iter(sys.argv[1:])
+    for param in params:
+        if param.startswith('-'):
+            if param in ('-h', '--help'): usage()
+            elif param == '--hardlink': do_hardlinks = True
+            elif param == '--hidehardlinks': do_hidehardlinks = True
+            elif param == '--': break
+            else: usage()
+        else:
+            directories.append(param)
+    directories.extend(params)
+
+    duplicates = sorted((get_size(files_by_hash[0][0]), sorted(files_by_hash))
+        for files_by_size  in group_by(get_files(directories), get_size)
+        for files_by_start in group_by(files_by_size,          get_start)
+        for files_by_hash  in group_by(files_by_start,         get_hash)
+    )
+
+    for size, files in duplicates:
+        dev_inodes = set((dev,ino) for name, dev, ino in files)
+        if len(dev_inodes) > 1 or not do_hidehardlinks:
+            print(fsize(size))
+            for name, dev, ino in files:
+                print("    '%s' (%s, %s)"%(name, dev, ino))
+        if do_hardlinks and len(dev_inodes) > 1:
+            devs = set(dev for name, dev, ino in files)
+            if len(devs) > 1:
+                error("Can not hardlink files in several partitions")
+            ref_name, ref_dev, ref_ino = files[0]
+            for name, dev, ino in files:
+                if ino != ref_ino:
+                    if not same(name, ref_name): error("%s and %s have the same hash but differ"%(name, ref_name))
+                    print("        hardlink %s to %s"%(name, ref_name))
+                    os.remove(name)
+                    os.link(ref_name, name)
